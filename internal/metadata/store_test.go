@@ -116,13 +116,12 @@ func TestListUsesBoundedExclusiveCursorAndHonorsCancellation(t *testing.T) {
 }
 
 func TestWriterWaitIsCancelable(t *testing.T) {
-	store := openStore(t)
-	store.writer <- struct{}{}
-	defer func() { <-store.writer }()
+	writer := &writeQueue{requests: make(chan *writeRequest, 1)}
+	writer.requests <- nil
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, _, err := store.Put(ctx, storedTemplate("blocked")); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("writer wait did not respect deadline: %v", err)
+	if result := writer.submit(ctx, storedTemplate("blocked")); !errors.Is(result.err, context.DeadlineExceeded) {
+		t.Fatalf("writer queue did not respect deadline: %v", result.err)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -25,10 +26,12 @@ var (
 )
 
 // Store holds one process-wide database handle with durable write transactions.
-// Its bounded writer gate lets callers cancel while waiting for another write.
+// Concurrent writes share durable transactions through one process-owned writer.
 type Store struct {
-	db     *bolt.DB
-	writer chan struct{}
+	db        *bolt.DB
+	writer    *writeQueue
+	closeOnce sync.Once
+	closeErr  error
 }
 
 var _ template.Store = (*Store)(nil)
@@ -84,51 +87,52 @@ func Open(directory string) (*Store, error) {
 	if err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
-	return &Store{db: db, writer: make(chan struct{}, 1)}, nil
+	return &Store{db: db, writer: newWriteQueue(db)}, nil
 }
 
 // Close releases node state after HTTP requests and background users have stopped.
-func (s *Store) Close() error { return s.db.Close() }
-
-// Put binds a name once and preserves the original record on identical retries.
-func (s *Store) Put(ctx context.Context, record template.Template) (result template.Template, created bool, err error) {
-	if err := record.Validate(); err != nil {
-		return result, false, err
-	}
-	select {
-	case s.writer <- struct{}{}:
-		defer func() { <-s.writer }()
-	case <-ctx.Done():
-		return result, false, ctx.Err()
-	}
-	err = s.db.Update(func(tx *bolt.Tx) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		bucket := tx.Bucket(metadataKey).Bucket(templatesKey)
-		key := []byte(record.Name)
-		if data := bucket.Get(key); data != nil {
-			if err := decode(data, &result); err != nil {
-				return err
-			}
-			if result.SnapshotID != record.SnapshotID || result.ImageDigest != record.ImageDigest ||
-				result.VMM != record.VMM || result.BootProfile != record.BootProfile || result.OS != record.OS ||
-				result.Architecture != record.Architecture || !sameJSON(result.GuestConfig, record.GuestConfig) {
-				return template.ErrConflict
-			}
-			return nil
-		}
-		data, err := json.Marshal(record)
-		if err != nil {
-			return err
-		}
-		if err := bucket.Put(key, data); err != nil {
-			return err
-		}
-		result, created = record, true
-		return nil
+func (s *Store) Close() error {
+	s.closeOnce.Do(func() {
+		s.writer.close()
+		s.closeErr = s.db.Close()
 	})
-	return result, created && err == nil, err
+	return s.closeErr
+}
+
+// Put binds a name once and acknowledges it only after a durable commit.
+// Waiting to enqueue is cancelable. Accepted requests wait for a known result;
+// cancellation is checked again before any transaction changes the record.
+func (s *Store) Put(ctx context.Context, record template.Template) (template.Template, bool, error) {
+	if err := record.Validate(); err != nil {
+		return template.Template{}, false, err
+	}
+	result := s.writer.submit(ctx, record)
+	return result.record, result.created, result.err
+}
+
+func putTemplate(tx *bolt.Tx, record template.Template) (template.Template, bool, error) {
+	bucket := tx.Bucket(metadataKey).Bucket(templatesKey)
+	key := []byte(record.Name)
+	if data := bucket.Get(key); data != nil {
+		var existing template.Template
+		if err := decode(data, &existing); err != nil {
+			return template.Template{}, false, err
+		}
+		if existing.SnapshotID != record.SnapshotID || existing.ImageDigest != record.ImageDigest ||
+			existing.VMM != record.VMM || existing.BootProfile != record.BootProfile || existing.OS != record.OS ||
+			existing.Architecture != record.Architecture || !sameJSON(existing.GuestConfig, record.GuestConfig) {
+			return template.Template{}, false, template.ErrConflict
+		}
+		return existing, false, nil
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return template.Template{}, false, err
+	}
+	if err := bucket.Put(key, data); err != nil {
+		return template.Template{}, false, err
+	}
+	return record, true, nil
 }
 
 // Get returns a validated copy that remains valid after its read transaction.
