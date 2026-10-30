@@ -7,7 +7,6 @@ package node
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -24,6 +23,8 @@ type RuntimeChecker interface {
 
 // Options bounds dependency probes and graceful server shutdown.
 type Options struct {
+	// OperationTimeout bounds template operations independently of health probes.
+	OperationTimeout time.Duration
 	// ProbeTimeout caps the runtime call made by each /readyz request.
 	ProbeTimeout time.Duration
 	// ShutdownTimeout caps draining requests after the process is signaled.
@@ -32,26 +33,30 @@ type Options struct {
 
 // Server owns the HTTP API, but never owns runtime processes or databases.
 type Server struct {
-	runtime RuntimeChecker
-	options Options
-	logger  *slog.Logger
-	handler http.Handler
+	runtime   RuntimeChecker
+	templates TemplateCatalog
+	options   Options
+	logger    *slog.Logger
+	handler   http.Handler
 }
 
 // New validates required dependencies once and installs the node routes.
-func New(runtime RuntimeChecker, options Options, logger *slog.Logger) (*Server, error) {
-	if runtime == nil || logger == nil {
-		return nil, errors.New("runtime checker and logger are required")
+func New(runtime RuntimeChecker, templates TemplateCatalog, options Options, logger *slog.Logger) (*Server, error) {
+	if runtime == nil || templates == nil || logger == nil {
+		return nil, errors.New("runtime checker, template catalog and logger are required")
 	}
-	if options.ProbeTimeout <= 0 || options.ShutdownTimeout <= 0 {
-		return nil, errors.New("probe and shutdown timeouts must be positive")
+	if options.ProbeTimeout <= 0 || options.ShutdownTimeout <= 0 || options.OperationTimeout <= 0 {
+		return nil, errors.New("probe, operation and shutdown timeouts must be positive")
 	}
-	server := &Server{runtime: runtime, options: options, logger: logger}
+	server := &Server{runtime: runtime, templates: templates, options: options, logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		server.respond(w, http.StatusOK, "ok")
 	})
 	mux.HandleFunc("GET /readyz", server.ready)
+	mux.HandleFunc("POST /v1/templates", server.registerTemplate)
+	mux.HandleFunc("GET /v1/templates", server.listTemplates)
+	mux.HandleFunc("GET /v1/templates/{name}", server.getTemplate)
 	server.handler = mux
 	return server, nil
 }
@@ -68,14 +73,9 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) respond(w http.ResponseWriter, status int, state string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(struct {
+	s.writeJSON(w, status, struct {
 		Status string `json:"status"`
-	}{Status: state}); err != nil {
-		s.logger.Debug("write health response", "error", err)
-	}
+	}{Status: state})
 }
 
 // Run takes ownership of listener and drains requests when ctx is canceled.
@@ -89,7 +89,7 @@ func (s *Server) Run(ctx context.Context, listener net.Listener) error {
 		Handler:           s.handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      s.options.ProbeTimeout + 5*time.Second,
+		WriteTimeout:      max(s.options.ProbeTimeout, s.options.OperationTimeout) + 5*time.Second,
 		IdleTimeout:       time.Minute,
 		MaxHeaderBytes:    16 << 10,
 		BaseContext:       func(net.Listener) context.Context { return ctx },

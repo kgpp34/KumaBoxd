@@ -52,7 +52,7 @@ func TestCheckUsesRuntimeRPCAndReusesConnection(t *testing.T) {
 		// The runtime currently encodes NodeInfo fields with Go's default casing.
 		_, _ = io.WriteString(w, "{\"type\":\"result\",\"data\":{\"Version\":\"test-build\"}}\n")
 	})
-	client, err := New(socket)
+	client, err := New(socket, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestCheckHonorsCancellation(t *testing.T) {
 		close(entered)
 		<-r.Context().Done()
 	})
-	client, err := New(socket)
+	client, err := New(socket, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,14 +107,14 @@ func TestCheckRejectsUnavailableAndOversizedResponses(t *testing.T) {
 		body   string
 	}{
 		{"unavailable", http.StatusServiceUnavailable, "busy"},
-		{"oversized", http.StatusOK, strings.Repeat("x", maxProbeResponse+1)},
+		{"oversized", http.StatusOK, strings.Repeat("x", maxFrame+1)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			socket := startRuntime(t, new(atomic.Int32), func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(test.status)
 				_, _ = io.WriteString(w, test.body)
 			})
-			client, err := New(socket)
+			client, err := New(socket, 5*time.Second)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -126,17 +126,24 @@ func TestCheckRejectsUnavailableAndOversizedResponses(t *testing.T) {
 	}
 }
 
-func TestValidateProbeRejectsIncompleteAndFailedResults(t *testing.T) {
+func TestCheckRejectsIncompleteAndFailedResults(t *testing.T) {
 	for _, data := range []string{
 		``, `null`, `{`, `{"type":"progress"}`,
 		`{"type":"result","data":null}`,
 		`{"type":"result","data":{"Version":" "}}`,
-		`{"type":"result","failure":{"message":"unavailable"}}`,
-		"{\"type\":\"result\",\"data\":{\"Version\":\"test\"}}\n{}",
+		`{"type":"result","failure":{"message":"unavailable","class":4,"code":"ARTIFACT_UNAVAILABLE"}}`,
 	} {
-		if err := validateProbe([]byte(data)); err == nil {
-			t.Errorf("accepted invalid probe %q", data)
-		}
+		t.Run(data, func(t *testing.T) {
+			socket := startRuntime(t, new(atomic.Int32), func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, data) })
+			client, err := New(socket, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = client.Close() }()
+			if err := client.Check(context.Background()); err == nil {
+				t.Errorf("accepted invalid probe %q", data)
+			}
+		})
 	}
 }
 

@@ -14,8 +14,10 @@ import (
 	"syscall"
 
 	"github.com/kgpp34/kumaboxd/internal/config"
+	"github.com/kgpp34/kumaboxd/internal/metadata"
 	"github.com/kgpp34/kumaboxd/internal/node"
 	"github.com/kgpp34/kumaboxd/internal/runtimeclient"
+	"github.com/kgpp34/kumaboxd/internal/template"
 )
 
 // version is injected by the release build; local go run builds use dev.
@@ -42,14 +44,29 @@ func run(ctx context.Context, args []string, getenv func(string) string, output,
 		return 0
 	}
 	logger := slog.New(slog.NewJSONHandler(diagnostics, nil))
-	client, err := runtimeclient.New(cfg.RuntimeSocket)
+	client, err := runtimeclient.New(cfg.RuntimeSocket, cfg.OperationTimeout)
 	if err != nil {
 		logger.Error("configure runtime client", "error", err)
 		return 1
 	}
 	defer func() { _ = client.Close() }()
-	server, err := node.New(client, node.Options{
-		ProbeTimeout: cfg.ProbeTimeout, ShutdownTimeout: cfg.ShutdownTimeout,
+	store, err := metadata.Open(cfg.StateDir)
+	if err != nil {
+		logger.Error("open node metadata", "error", err)
+		return 1
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			logger.Error("close node metadata", "error", err)
+		}
+	}()
+	templates, err := template.New(client, store)
+	if err != nil {
+		logger.Error("configure templates", "error", err)
+		return 1
+	}
+	server, err := node.New(client, templates, node.Options{
+		ProbeTimeout: cfg.ProbeTimeout, ShutdownTimeout: cfg.ShutdownTimeout, OperationTimeout: cfg.OperationTimeout,
 	}, logger)
 	if err != nil {
 		logger.Error("configure node service", "error", err)

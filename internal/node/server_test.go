@@ -113,7 +113,7 @@ func TestRunCancelsInflightProbeAndClosesListener(t *testing.T) {
 
 func newServer(t *testing.T, check checkerFunc) *Server {
 	t.Helper()
-	server, err := New(check, Options{ProbeTimeout: 100 * time.Millisecond, ShutdownTimeout: time.Second},
+	server, err := New(check, fakeTemplates{}, Options{OperationTimeout: time.Second, ProbeTimeout: 100 * time.Millisecond, ShutdownTimeout: time.Second},
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)

@@ -1,8 +1,9 @@
-// Package runtimeclient connects to the KumaBox local RPC v1 endpoint.
-// It owns transport connections only; VM state remains owned by the runtime.
+// Package runtimeclient implements typed KumaBox RPC operations over a reused
+// HTTP/2 Unix connection. It never opens runtime databases or retries mutations.
 package runtimeclient
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -17,103 +18,136 @@ import (
 	"time"
 )
 
-const maxProbeResponse = 64 << 10
+const maxFrame = 8 << 20
 
-// Client reuses HTTP/2 connections to one local runtime daemon.
+// Client owns reusable connections. Callers provide per-operation contexts;
+// timeout is an additional upper bound, including streamed command output.
 type Client struct {
 	http      *http.Client
 	transport *http.Transport
 }
 
-// New validates the endpoint without opening runtime files or connecting yet.
-func New(socket string) (*Client, error) {
-	if !filepath.IsAbs(socket) {
-		return nil, errors.New("runtime socket must be an absolute path")
+// New validates transport settings without connecting or opening runtime state.
+func New(socket string, timeout time.Duration) (*Client, error) {
+	if !filepath.IsAbs(socket) || timeout <= 0 {
+		return nil, errors.New("absolute runtime socket and positive request timeout are required")
 	}
 	protocols := new(http.Protocols)
 	protocols.SetUnencryptedHTTP2(true)
 	transport := &http.Transport{
-		Protocols:       protocols,
-		IdleConnTimeout: 90 * time.Second,
+		Protocols: protocols, IdleConnTimeout: 90 * time.Second,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", socket)
 		},
 	}
-	return &Client{
-		http:      &http.Client{Transport: transport, Timeout: 5 * time.Second},
-		transport: transport,
-	}, nil
+	return &Client{http: &http.Client{Transport: transport, Timeout: timeout}, transport: transport}, nil
 }
 
-// Check verifies a terminal node.info response, not just socket connectivity.
-// This read-only adapter deliberately does not expose a generic mutation API.
+// Check verifies a terminal node.info response, rather than socket connectivity.
 func (c *Client) Check(ctx context.Context) error {
-	deadline, _ := ctx.Deadline()
-	metadata, err := json.Marshal(struct {
-		Params   struct{}  `json:"params"`
-		Deadline time.Time `json:"deadline,omitzero"`
-	}{Deadline: deadline})
-	if err != nil {
-		return fmt.Errorf("encode node probe: %w", err)
+	var result struct {
+		Version string `json:"Version"`
 	}
-	// RPC v1 starts with a four-byte, big-endian metadata length.
-	// The envelope has fixed fields and is always far below the 1 MiB limit.
-	body := make([]byte, 4+len(metadata))
-	binary.BigEndian.PutUint32(body, uint32(len(metadata)))
-	copy(body[4:], metadata)
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"http://kumabox/rpc/v1/node.info", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create node probe: %w", err)
+	if err := c.call(ctx, "node.info", struct{}{}, &result, nil, nil, false); err != nil {
+		return err
 	}
-	response, err := c.http.Do(request)
-	if err != nil {
-		return fmt.Errorf("contact KumaBox runtime: %w", err)
-	}
-	defer func() { _ = response.Body.Close() }()
-	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("runtime node.info: HTTP %d", response.StatusCode)
-	}
-	if response.ProtoMajor != 2 {
-		return errors.New("runtime node.info requires HTTP/2")
-	}
-	data, err := io.ReadAll(io.LimitReader(response.Body, maxProbeResponse+1))
-	if err != nil {
-		return fmt.Errorf("read node probe: %w", err)
-	}
-	if len(data) > maxProbeResponse {
-		return errors.New("runtime node.info response exceeds 64 KiB")
-	}
-	return validateProbe(data)
-}
-
-func validateProbe(data []byte) error {
-	var frame struct {
-		Type string `json:"type"`
-		Data struct {
-			Version string `json:"version"`
-		} `json:"data"`
-		Failure *struct {
-			Message string `json:"message"`
-		} `json:"failure"`
-	}
-	if err := json.Unmarshal(data, &frame); err != nil {
-		return fmt.Errorf("decode node probe: %w", err)
-	}
-	if frame.Type != "result" {
-		return errors.New("runtime node.info did not return a terminal result")
-	}
-	if frame.Failure != nil {
-		return fmt.Errorf("runtime node.info failed: %s", frame.Failure.Message)
-	}
-	if strings.TrimSpace(frame.Data.Version) == "" {
+	if strings.TrimSpace(result.Version) == "" {
 		return errors.New("runtime node.info returned no build version")
 	}
 	return nil
 }
 
-// Close releases idle connections. It never stops the runtime or its VMs.
+// Close releases idle connections without stopping the runtime or its VMs.
 func (c *Client) Close() error {
 	c.transport.CloseIdleConnections()
 	return nil
+}
+
+func (c *Client) call(ctx context.Context, method string, params, result any, stdout, stderr io.Writer, mutation bool) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	metadata, err := json.Marshal(struct {
+		Params   any       `json:"params"`
+		Deadline time.Time `json:"deadline,omitzero"`
+	}{Params: params, Deadline: deadline})
+	if err != nil {
+		return fmt.Errorf("encode %s: %w", method, err)
+	}
+	if len(metadata) > 1<<20 {
+		return errors.New("runtime request metadata exceeds 1 MiB")
+	}
+	body := make([]byte, 4+len(metadata))
+	binary.BigEndian.PutUint32(body, uint32(len(metadata))) // len is bounded above.
+	copy(body[4:], metadata)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://kumabox/rpc/v1/"+method, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/octet-stream")
+	response, err := c.http.Do(request)
+	if err != nil {
+		return interrupted(method, err, mutation)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		err := &HTTPError{Status: response.StatusCode, Operation: method}
+		return interrupted(method, err, mutation && response.StatusCode >= 500)
+	}
+	if response.ProtoMajor != 2 {
+		return interrupted(method, errors.New("runtime RPC requires HTTP/2"), mutation)
+	}
+	scanner := bufio.NewScanner(response.Body)
+	scanner.Buffer(make([]byte, 64<<10), maxFrame)
+	for scanner.Scan() {
+		var frame struct {
+			Type    string          `json:"type"`
+			Data    json.RawMessage `json:"data"`
+			Bytes   []byte          `json:"bytes"`
+			Failure *RemoteError    `json:"failure"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &frame); err != nil {
+			return interrupted(method, fmt.Errorf("decode response: %w", err), mutation)
+		}
+		switch frame.Type {
+		case "stdout", "stderr":
+			writer := stdout
+			if frame.Type == "stderr" {
+				writer = stderr
+			}
+			if writer != nil {
+				if n, err := writer.Write(frame.Bytes); err != nil || n != len(frame.Bytes) {
+					if err == nil {
+						err = io.ErrShortWrite
+					}
+					return interrupted(method, err, mutation)
+				}
+			}
+		case "result":
+			// Partial results remain useful when the runtime reports a committed error.
+			if result != nil && len(frame.Data) != 0 && string(frame.Data) != "null" {
+				if err := json.Unmarshal(frame.Data, result); err != nil {
+					return interrupted(method, err, mutation)
+				}
+			}
+			if frame.Failure != nil {
+				return frame.Failure
+			}
+			if len(frame.Data) == 0 || string(frame.Data) == "null" {
+				return interrupted(method, errors.New("runtime returned an empty result"), mutation)
+			}
+			return nil
+		default:
+			// Progress and commit notifications are not terminal acknowledgments.
+		}
+	}
+	err = scanner.Err()
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	return interrupted(method, err, mutation)
 }
