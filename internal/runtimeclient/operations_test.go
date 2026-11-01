@@ -44,6 +44,11 @@ func TestTypedOperationsMatchRuntimeWireContract(t *testing.T) {
 				t.Errorf("list parameters: %s", params)
 			}
 			result = "[" + result + "]"
+		case "sandbox.status":
+			if string(params) != "[]" {
+				t.Errorf("status parameters: %s", params)
+			}
+			result = `[{"Sandbox":` + result + `,"Runtime":"absent","Stale":true}]`
 		case "sandbox.stop":
 			if !bytes.Contains(params, []byte(`"Force":true`)) {
 				t.Errorf("stop parameters: %s", params)
@@ -83,14 +88,18 @@ func TestTypedOperationsMatchRuntimeWireContract(t *testing.T) {
 	if err != nil || len(listed) != 1 {
 		t.Fatalf("list = %+v, %v", listed, err)
 	}
+	observed, err := client.Status(ctx)
+	if err != nil || len(observed) != 1 || !observed[0].Stale || observed[0].Runtime != "absent" {
+		t.Fatalf("status observation lost: %+v %v", observed, err)
+	}
 	if _, err := client.Stop(ctx, clone.ID, true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := client.Remove(ctx, clone.ID); err != nil {
 		t.Fatal(err)
 	}
-	if calls.Load() != 7 {
-		t.Fatalf("got %d calls, want 7", calls.Load())
+	if calls.Load() != 8 {
+		t.Fatalf("got %d calls, want 8", calls.Load())
 	}
 }
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -23,19 +22,8 @@ type TemplateCatalog interface {
 func (s *Server) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.options.OperationTimeout)
 	defer cancel()
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
 	var request template.RegisterRequest
-	if err := decoder.Decode(&request); err != nil {
-		s.badRequest(w, err)
-		return
-	}
-	if err := decoder.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
-		if err == nil {
-			err = errors.New("request must contain exactly one JSON object")
-		}
-		s.badRequest(w, err)
+	if !s.decodeRequest(w, r, &request) {
 		return
 	}
 	record, created, err := s.templates.Register(ctx, request)

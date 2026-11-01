@@ -38,13 +38,20 @@ type Image struct {
 // GuestConfig is the subset needed for admission and network readiness checks.
 // The complete captured configuration is retained separately in Snapshot.Config.
 type GuestConfig struct {
-	Name           string `json:"Name"`
-	CPUs           uint32 `json:"CPUs"`
-	Memory         int64  `json:"Memory"`
-	Storage        int64  `json:"Storage"`
-	NICs           int    `json:"NICs"`
-	NetworkBackend string `json:"NetworkBackend"`
-	NetworkName    string `json:"NetworkName"`
+	DataDisks      []DataDisk `json:"DataDisks,omitempty"`
+	Name           string     `json:"Name"`
+	CPUs           uint32     `json:"CPUs"`
+	Memory         int64      `json:"Memory"`
+	Storage        int64      `json:"Storage"`
+	NICs           int        `json:"NICs"`
+	NetworkBackend string     `json:"NetworkBackend"`
+	NetworkName    string     `json:"NetworkName"`
+}
+
+// DataDisk projects captured writable-disk identity and reservation size.
+type DataDisk struct {
+	Name string `json:"Name"`
+	Size int64  `json:"Size"`
 }
 
 // Sandbox is an observation; KumaBoxd does not become the VM's source of truth.
@@ -168,4 +175,21 @@ func validReference(value string) error {
 		return errors.New("resource reference must contain 1..512 bytes without control characters")
 	}
 	return nil
+}
+
+// SandboxStatus combines durable state with the runtime's identity-checked live VMM observation.
+type SandboxStatus struct {
+	Sandbox Sandbox `json:"Sandbox"`
+	Runtime string  `json:"Runtime"`
+	Stale   bool    `json:"Stale"`
+}
+
+// Status observes live processes through the existing runtime API.
+func (c *Client) Status(ctx context.Context, references ...string) ([]SandboxStatus, error) {
+	result := make([]SandboxStatus, 0)
+	if references == nil {
+		references = []string{}
+	}
+	err := c.call(ctx, "sandbox.status", references, &result, nil, nil, false)
+	return result, err
 }

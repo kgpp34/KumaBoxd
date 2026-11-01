@@ -35,13 +35,14 @@ type Options struct {
 type Server struct {
 	runtime   RuntimeChecker
 	templates TemplateCatalog
+	pools     PoolManager
 	options   Options
 	logger    *slog.Logger
 	handler   http.Handler
 }
 
 // New validates required dependencies once and installs the node routes.
-func New(runtime RuntimeChecker, templates TemplateCatalog, options Options, logger *slog.Logger) (*Server, error) {
+func New(runtime RuntimeChecker, templates TemplateCatalog, options Options, logger *slog.Logger, extensions ...Option) (*Server, error) {
 	if runtime == nil || templates == nil || logger == nil {
 		return nil, errors.New("runtime checker, template catalog and logger are required")
 	}
@@ -49,6 +50,14 @@ func New(runtime RuntimeChecker, templates TemplateCatalog, options Options, log
 		return nil, errors.New("probe, operation and shutdown timeouts must be positive")
 	}
 	server := &Server{runtime: runtime, templates: templates, options: options, logger: logger}
+	for _, extend := range extensions {
+		if extend == nil {
+			return nil, errors.New("nil node option")
+		}
+		if err := extend(server); err != nil {
+			return nil, err
+		}
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		server.respond(w, http.StatusOK, "ok")
@@ -57,11 +66,24 @@ func New(runtime RuntimeChecker, templates TemplateCatalog, options Options, log
 	mux.HandleFunc("POST /v1/templates", server.registerTemplate)
 	mux.HandleFunc("GET /v1/templates", server.listTemplates)
 	mux.HandleFunc("GET /v1/templates/{name}", server.getTemplate)
+	if server.pools != nil {
+		mux.HandleFunc("POST /v1/pools", server.configurePool)
+		mux.HandleFunc("GET /v1/pools", server.listPools)
+		mux.HandleFunc("GET /v1/pools/{name}", server.poolStatus)
+		mux.HandleFunc("POST /v1/pools/{name}/claims", server.claim)
+		mux.HandleFunc("GET /v1/leases/{id}", server.getLease)
+		mux.HandleFunc("DELETE /v1/leases/{id}", server.release)
+		mux.HandleFunc("PUT /v1/leases/{id}/expiry", server.renew)
+	}
 	server.handler = mux
 	return server, nil
 }
 
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
+	if s.pools != nil && !s.pools.Ready() {
+		s.respond(w, http.StatusServiceUnavailable, "not_ready")
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.options.ProbeTimeout)
 	defer cancel()
 	if err := s.runtime.Check(ctx); err != nil {

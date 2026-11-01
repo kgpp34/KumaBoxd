@@ -28,6 +28,7 @@ var (
 // Store holds one process-wide database handle with durable write transactions.
 // Concurrent writes share durable transactions through one process-owned writer.
 type Store struct {
+	nodeID    string
 	db        *bolt.DB
 	writer    *writeQueue
 	closeOnce sync.Once
@@ -68,7 +69,7 @@ func Open(directory string) (*Store, error) {
 			if string(root.Get(formatKey)) != format || root.Bucket(templatesKey) == nil {
 				return errors.New("unsupported node database format")
 			}
-			return nil
+			return initializePools(root)
 		}
 		key, _ := tx.Cursor().First()
 		if key != nil {
@@ -81,13 +82,19 @@ func Open(directory string) (*Store, error) {
 		if err := root.Put(formatKey, []byte(format)); err != nil {
 			return err
 		}
-		_, err = root.CreateBucket(templatesKey)
-		return err
+		if _, err = root.CreateBucket(templatesKey); err != nil {
+			return err
+		}
+		return initializePools(root)
 	})
 	if err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
-	return &Store{db: db, writer: newWriteQueue(db)}, nil
+	var nodeID string
+	if err := db.View(func(tx *bolt.Tx) error { nodeID = string(tx.Bucket(metadataKey).Get(nodeIDKey)); return nil }); err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
+	return &Store{nodeID: nodeID, db: db, writer: newWriteQueue(db)}, nil
 }
 
 // Close releases node state after HTTP requests and background users have stopped.

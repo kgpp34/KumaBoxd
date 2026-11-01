@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/kgpp34/kumaboxd/internal/pool"
 	"github.com/kgpp34/kumaboxd/internal/template"
 )
 
@@ -96,4 +97,17 @@ func TestCanceledQueuedRequestDoesNotPreventOtherCommits(t *testing.T) {
 
 func batchRequest(name string) *writeRequest {
 	return &writeRequest{ctx: context.Background(), record: storedTemplate(name), reply: make(chan writeResult, 1)}
+}
+
+func TestReadOnlyPoolTransactionsDoNotCommitAnEmptyWrite(t *testing.T) {
+	store := openStore(t)
+	before := store.db.Stats().TxStats.Write
+	for range 5 {
+		if err := store.Write(context.Background(), func(pool.WriteTx) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if after := store.db.Stats().TxStats.Write; after != before {
+		t.Fatalf("read-only transitions wrote database pages: %d -> %d", before, after)
+	}
 }

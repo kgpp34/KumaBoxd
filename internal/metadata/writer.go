@@ -31,10 +31,14 @@ type writeQueue struct {
 type writeRequest struct {
 	ctx    context.Context
 	record template.Template
+	apply  func(*bolt.Tx) (writeResult, error)
 	reply  chan writeResult
 }
 
+var errNoChanges = errors.New("metadata transaction has no durable changes")
+
 type writeResult struct {
+	changed bool
 	record  template.Template
 	created bool
 	err     error
@@ -49,7 +53,11 @@ func newWriteQueue(db *bolt.DB) *writeQueue {
 }
 
 func (w *writeQueue) submit(ctx context.Context, record template.Template) writeResult {
-	request := &writeRequest{ctx: ctx, record: record, reply: make(chan writeResult, 1)}
+	return w.enqueue(&writeRequest{ctx: ctx, record: record, reply: make(chan writeResult, 1)})
+}
+
+func (w *writeQueue) enqueue(request *writeRequest) writeResult {
+	ctx := request.ctx
 	w.admission.RLock()
 	if w.closed {
 		w.admission.RUnlock()
@@ -91,22 +99,39 @@ func (w *writeQueue) run() {
 
 func (w *writeQueue) commit(batch []*writeRequest) {
 	results := make([]writeResult, len(batch))
+	changed := false
 	err := w.db.Update(func(tx *bolt.Tx) error {
 		for index, request := range batch {
 			if err := request.ctx.Err(); err != nil {
 				results[index].err = err
 				continue
 			}
+			if request.apply != nil {
+				result, err := request.apply(tx)
+				results[index] = result
+				changed = changed || result.changed
+				if err != nil {
+					return err
+				}
+				continue
+			}
 			record, created, err := putTemplate(tx, request.record)
-			results[index] = writeResult{record: record, created: created, err: err}
+			results[index] = writeResult{record: record, created: created, changed: created, err: err}
+			changed = changed || created
 			// A name conflict is isolated to its request. Storage errors roll back
 			// the whole transaction, so no earlier request receives false success.
 			if err != nil && !errors.Is(err, template.ErrConflict) {
 				return err
 			}
 		}
+		if !changed {
+			return errNoChanges
+		}
 		return nil
 	})
+	if errors.Is(err, errNoChanges) {
+		err = nil
+	}
 	for index, request := range batch {
 		result := results[index]
 		if err != nil {

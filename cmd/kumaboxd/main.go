@@ -16,6 +16,7 @@ import (
 	"github.com/kgpp34/kumaboxd/internal/config"
 	"github.com/kgpp34/kumaboxd/internal/metadata"
 	"github.com/kgpp34/kumaboxd/internal/node"
+	"github.com/kgpp34/kumaboxd/internal/pool"
 	"github.com/kgpp34/kumaboxd/internal/runtimeclient"
 	"github.com/kgpp34/kumaboxd/internal/template"
 )
@@ -65,9 +66,16 @@ func run(ctx context.Context, args []string, getenv func(string) string, output,
 		logger.Error("configure templates", "error", err)
 		return 1
 	}
+	poolOptions := cfg.Pool
+	poolOptions.OperationTimeout = cfg.OperationTimeout
+	inventory, err := pool.New(store, client, templates, pool.FixedPolicy{}, poolOptions, logger)
+	if err != nil {
+		logger.Error("configure warm pools", "error", err)
+		return 1
+	}
 	server, err := node.New(client, templates, node.Options{
 		ProbeTimeout: cfg.ProbeTimeout, ShutdownTimeout: cfg.ShutdownTimeout, OperationTimeout: cfg.OperationTimeout,
-	}, logger)
+	}, logger, node.WithPools(inventory))
 	if err != nil {
 		logger.Error("configure node service", "error", err)
 		return 1
@@ -79,7 +87,13 @@ func run(ctx context.Context, args []string, getenv func(string) string, output,
 	}
 	logger.Info("starting node service", "listen", listener.Addr().String(),
 		"runtime_socket", cfg.RuntimeSocket, "version", version)
-	if err := server.Run(ctx, listener); err != nil {
+	serviceCtx, cancelService := context.WithCancel(ctx)
+	defer cancelService()
+	poolResult := make(chan error, 1)
+	go func() { err := inventory.Run(serviceCtx); poolResult <- err; cancelService() }()
+	serveErr := server.Run(serviceCtx, listener)
+	cancelService()
+	if err := errors.Join(serveErr, <-poolResult); err != nil {
 		logger.Error("node service stopped", "error", err)
 		return 1
 	}
