@@ -107,17 +107,18 @@ func (s *Service) Configure(ctx context.Context, spec Spec) (Record, bool, error
 
 // Status includes bounded cumulative observations for later policy evaluation.
 type Status struct {
-	ControllerReady bool    `json:"controller_ready"`
-	Record          Record  `json:"pool"`
-	Counts          Counts  `json:"counts"`
-	Metrics         Metrics `json:"metrics"`
+	ControllerReady bool       `json:"controller_ready"`
+	Durability      Durability `json:"durability"`
+	Record          Record     `json:"pool"`
+	Counts          Counts     `json:"counts"`
+	Metrics         Metrics    `json:"metrics"`
 }
 
 func (s *Service) Status(ctx context.Context, name string) (Status, error) {
 	if err := validName(name); err != nil {
 		return Status{}, err
 	}
-	out := Status{ControllerReady: s.Ready()}
+	out := Status{ControllerReady: s.Ready(), Durability: s.store.Durability()}
 	err := s.store.Read(ctx, func(tx ReadTx) error {
 		r, err := tx.Pool(name)
 		if err != nil {
@@ -145,7 +146,7 @@ func (s *Service) List(ctx context.Context) ([]Status, error) {
 			if err != nil {
 				return err
 			}
-			out = append(out, Status{ControllerReady: s.Ready(), Record: r, Counts: count(slots)})
+			out = append(out, Status{ControllerReady: s.Ready(), Durability: s.store.Durability(), Record: r, Counts: count(slots)})
 		}
 		return nil
 	})
@@ -208,7 +209,7 @@ func (s *Service) Claim(ctx context.Context, name string, request ClaimRequest) 
 			return err
 		}
 		now := time.Now().UTC()
-		result = Lease{ID: newID(), Pool: name, SlotID: slot.ID, SandboxID: slot.SandboxID, Owner: request.Owner, State: Active, KeyHash: keyHash, RequestHash: requestHash, CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Duration(request.TTLSeconds) * time.Second)}
+		result = Lease{Durability: s.store.Durability(), ID: newID(), Pool: name, SlotID: slot.ID, SandboxID: slot.SandboxID, Owner: request.Owner, State: Active, KeyHash: keyHash, RequestHash: requestHash, CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Duration(request.TTLSeconds) * time.Second)}
 		slot.State = Leased
 		slot.LeaseID = result.ID
 		slot.UpdatedAt = now
@@ -238,7 +239,7 @@ func (s *Service) Claim(ctx context.Context, name string, request ClaimRequest) 
 	return result, created, err
 }
 
-// GetLease returns the durable receipt, including its original expiry deadline.
+// GetLease returns the recorded receipt, including its original expiry deadline.
 func (s *Service) GetLease(ctx context.Context, id string) (Lease, error) {
 	if !ValidID(id) {
 		return Lease{}, ErrInvalid
@@ -270,6 +271,7 @@ func (s *Service) Renew(ctx context.Context, id string, expires time.Time) (Leas
 		if !expires.After(lease.ExpiresAt) || expires.After(now.Add(s.options.MaxTTL)) {
 			return ErrInvalid
 		}
+		lease.Durability = s.store.Durability()
 		lease.ExpiresAt = expires.UTC()
 		lease.UpdatedAt = now
 		tx.SaveLease(lease)
@@ -282,7 +284,7 @@ func (s *Service) Renew(ctx context.Context, id string, expires time.Time) (Leas
 	return result, err
 }
 
-// Release durably revokes allocation before asynchronous runtime reclamation.
+// Release records revoked allocation before asynchronous runtime reclamation.
 // A receipt remains available through ReceiptRetention for retry and inspection.
 func (s *Service) Release(ctx context.Context, id string) (Lease, error) {
 	if !ValidID(id) {
@@ -299,6 +301,7 @@ func (s *Service) Release(ctx context.Context, id string) (Lease, error) {
 			if err != nil {
 				return err
 			}
+			lease.Durability = s.store.Durability()
 			lease.State = Releasing
 			lease.UpdatedAt = time.Now().UTC()
 			slot.State = Retiring

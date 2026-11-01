@@ -51,7 +51,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, output,
 		return 1
 	}
 	defer func() { _ = client.Close() }()
-	store, err := metadata.Open(cfg.StateDir)
+	store, err := metadata.OpenWithOptions(cfg.StateDir, metadata.Options{PoolDurability: metadata.Durability(cfg.PoolDurability)})
 	if err != nil {
 		logger.Error("open node metadata", "error", err)
 		return 1
@@ -86,7 +86,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, output,
 		return 1
 	}
 	logger.Info("starting node service", "listen", listener.Addr().String(),
-		"runtime_socket", cfg.RuntimeSocket, "version", version)
+		"runtime_socket", cfg.RuntimeSocket, "version", version, "pool_durability", cfg.PoolDurability)
 	serviceCtx, cancelService := context.WithCancel(ctx)
 	defer cancelService()
 	poolResult := make(chan error, 1)

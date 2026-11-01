@@ -19,6 +19,8 @@ import (
 type Config struct {
 	// Pool bounds this node service's background work and VM reservations.
 	Pool pool.Options
+	// PoolDurability selects synchronous commits or buffered journal acknowledgements.
+	PoolDurability string
 	// Listen is the loopback-only HTTP endpoint for node health probes.
 	Listen string
 	// RuntimeSocket points to the existing KumaBox daemon, not its database.
@@ -40,6 +42,7 @@ type Config struct {
 func Parse(args []string, getenv func(string) string, output io.Writer) (Config, error) {
 	cfg := Config{
 		Pool:             pool.DefaultOptions(),
+		PoolDurability:   "sync",
 		Listen:           envOr(getenv, "KUMABOXD_LISTEN", "127.0.0.1:8088"),
 		RuntimeSocket:    envOr(getenv, "KUMABOXD_RUNTIME_SOCKET", "/run/kumabox/kumabox.sock"),
 		StateDir:         envOr(getenv, "KUMABOXD_STATE_DIR", "/var/lib/kumaboxd"),
@@ -55,6 +58,7 @@ func Parse(args []string, getenv func(string) string, output io.Writer) (Config,
 	flags.DurationVar(&cfg.OperationTimeout, "operation-timeout", cfg.OperationTimeout, "runtime and template operation timeout")
 	flags.DurationVar(&cfg.ProbeTimeout, "probe-timeout", cfg.ProbeTimeout, "runtime readiness timeout")
 	flags.DurationVar(&cfg.ShutdownTimeout, "shutdown-timeout", cfg.ShutdownTimeout, "HTTP shutdown timeout")
+	flags.StringVar(&cfg.PoolDurability, "pool-durability", cfg.PoolDurability, "pool acknowledgements: sync or buffered (recent buffered changes can be lost on host failure)")
 	flags.IntVar(&cfg.Pool.Workers, "pool-workers", cfg.Pool.Workers, "maximum concurrent background pool tasks")
 	flags.IntVar(&cfg.Pool.ReclaimWorkers, "pool-reclaim-workers", cfg.Pool.ReclaimWorkers, "background reclaim workers independent of provisioning")
 	flags.Uint64Var(&cfg.Pool.StorageBudget, "pool-storage-budget", cfg.Pool.StorageBudget, "node-wide pool logical disk reservation budget in bytes")
@@ -105,6 +109,9 @@ func (c Config) Validate() error {
 	if c.ProbeTimeout <= 0 || c.ShutdownTimeout <= 0 || c.OperationTimeout <= 0 ||
 		c.OperationTimeout > 24*time.Hour || c.ProbeTimeout > 24*time.Hour || c.ShutdownTimeout > 24*time.Hour {
 		return errors.New("timeouts must be positive and must not exceed 24h")
+	}
+	if c.PoolDurability != "" && c.PoolDurability != "sync" && c.PoolDurability != "buffered" {
+		return errors.New("pool-durability must be sync or buffered")
 	}
 	cfgPool := c.Pool
 	cfgPool.OperationTimeout = c.OperationTimeout

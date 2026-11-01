@@ -72,6 +72,7 @@ HTTP 当前仅允许绑定 loopback IP，默认 `127.0.0.1:8088`；远程 API �
 | `--operation-timeout` | — | `2m` |
 | `--probe-timeout` | — | `2s` |
 | `--shutdown-timeout` | — | `5s` |
+| `--pool-durability` | — | `sync`；`buffered` 不等待每次同步落盘 |
 | `--pool-workers` | — | `4`，后台创建/探测任务上限 |
 | `--pool-reclaim-workers` | — | `2`，独立的后台回收任务上限 |
 | `--pool-max-vms` | — | `64`，本服务拥有的 VM 总额 |
@@ -99,7 +100,7 @@ curl 'http://127.0.0.1:8088/v1/templates?limit=50'
 - 同名绑定其他快照或配置返回 `409`。名称须匹配 `[a-z0-9][a-z0-9._-]{0,62}`。
 - 列表使用 `limit`（1–200，默认 50）和 `after` 游标，响应提供 `next_cursor`。
 - 注册需要 runtime 可用；读取已注册记录不需要 runtime 在线。
-- 状态保存到独立的 `state-dir/node.db`，采用 bbolt 同步事务和进程独占文件锁；一个进程只打开一次。已排队的并发写入共用一次提交，不额外等待凑批；只有提交成功才应答；没有变更的检查或重试不写空事务。它是嵌入式库，不是 etcd 服务，没有中央数据库依赖。
+- 状态由独立的 `state-dir` 保存，采用进程独占锁；一个进程只打开一次 bbolt。模板写入始终同步落盘；默认 `sync` 模式的池变更也等待同步事务，已排队写入共用提交。`buffered` 模式使用下文的顺序日志与后台 checkpoint。没有变更的检查或重试不写空事务。bbolt 是嵌入式库，不是 etcd 服务，没有中央数据库依赖。
 - 注册验证元数据，不代替一次成功的原生快照恢复，也不会阻止 runtime 用户直接删除原快照。补池仍须确认制品存在、运行时兼容和 guest 就绪。
 
 这是**节点上的本地注册**。未来全局模板定义及制品来源，会与每台节点上的本地快照副本分开建模。本阶段不把本地 UUID 当作整个集群都能访问的快照文件。
@@ -134,7 +135,7 @@ curl -i http://127.0.0.1:8088/v1/pools/python-pool/claims \
 
 首次领取返回 `201`，包含 `id`（lease ID）、`sandbox_id`、`owner`、`expires_at` 等字段。相同池、相同幂等键和相同请求重试返回 `200` 与原租约；更换请求内容返回 `409`。提交与 HTTP 应答之间断线时，客户端必须保留原幂等键重试。租约已到期或归还后，原键返回 `410`，不会偷偷再分配一台 VM。
 
-池空时立即返回 `503 POOL_EMPTY` 与 Retry-After。第一版不在领取接口中等待补池，不自动回退为 clone。创建、guest 初始化、网络配置及策略计算都不在领取路径里。
+池空时立即返回 `503 POOL_EMPTY` 与 Retry-After。第一版不在领取接口中等待补池，不自动回退为 clone。创建、guest 初始化、网络配置及策略计算都不在领取路径里。日志/事务的等待边界由显式的持久化策略决定。
 
 ```bash
 # 查询租约；将 LEASE_ID 换成领取响应里的 id
@@ -154,6 +155,25 @@ curl -X DELETE http://127.0.0.1:8088/v1/leases/LEASE_ID
 已结束的租约回执至少保留 24h，之后按结束时间索引分批清理，每批最多 256 条并让出写入者；幂等键去重保证也限于该保留窗口。新的业务请求应始终使用新键。运行中 VM 意外消失时，租约会标记 `lost`，不会转交另一台 VM 来冒充原分配。
 
 再次 POST 同名池可以调整 `target_ready` 和 `max_total`，但不能改模板。`target_ready:0` 会停止新领取并逐步清空空闲库存，已领取的 VM 保持原租约。需要清空所有 VM 时，应先归还租约，再等待 `counts.total` 为 0。
+
+### 领取持久化策略
+
+默认保持 `--pool-durability=sync`。需要亚毫秒领取时可显式使用 buffered 模式：
+
+```bash
+sudo ./bin/kumaboxd --pool-durability=buffered --state-dir=/var/lib/kumaboxd-buffered
+```
+
+| 策略 | 领取应答前完成 | 恢复边界 |
+| --- | --- | --- |
+| `sync` | bbolt 同步提交 | 已应答变更等待稳定存储 |
+| `buffered` | 带序号和校验的日志追加到 OS 缓存、发布内存索引 | 普通进程异常退出可重放；宿主机掉电或系统故障可能丢失近期已应答变更 |
+
+buffered 模式不会关闭 bbolt 的同步保护。后台约每秒合并一次变更并同步 checkpoint；checkpoint 只在锁内短暂取得不可变记录引用，合并、序列化和磁盘同步在锁外完成。关闭服务时会等待最终 checkpoint。这个周期不是数据丢失窗口的硬上限，磁盘延迟或错误会影响 checkpoint 完成时间。
+
+日志按 4MiB 阈值在 checkpoint 后压缩；未 checkpoint 的积压上限为 64MiB，达到上限拒绝新变更。64MiB 限制日志积压，历史租约索引的内存仍随回执保留量增长。日志失败或 checkpoint 错误后拒绝继续分配，需排查并重启；完整损坏记录不静默忽略，只有不完整的末尾写入会被截断。租约幂等字段、租约占用与库存状态处于同一个日志记录中，避免重启后把已领取 VM 再次发放。
+
+池状态和新租约响应均提供 `durability` 字段。策略会记录到 state-dir；已有策略与启动参数不一致时会拒绝打开，不会忽略尚未重放的日志。日常重启须沿用原策略。不要直接删除有存量 VM 或租约的 state-dir；如需换目录，应先归还租约并排空原服务。
 
 ### 资源与恢复边界
 
@@ -180,7 +200,7 @@ cmd/kumaboxd/           参数入口、依赖组装、信号处理
 internal/config/       配置读取与校验
 internal/node/         节点 HTTP 服务与生命周期
 internal/template/     本地模板模型、校验和注册流程
-internal/metadata/     模板、库存与租约的事务适配器
+internal/metadata/     事务适配、内存索引、顺序日志与后台 checkpoint
 internal/pool/         库存策略、后台执行、健康观测与租约流程
 internal/runtimeclient/  KumaBox RPC 适配器
 assets/logo.png        项目徽标原图
@@ -213,6 +233,8 @@ sudo env KUMABOXD_E2E_SOCKET=/run/kumabox/kumabox.sock \
 设置 `KUMABOXD_POOL_BENCH=1` 并指定 `-run '^TestWarmPool$'` 可额外运行 5 批 × 16 路的领取测试，分别测池容量封顶和后台可补充两种情形，输出原始纳秒样本。该测试会预热 16 台 VM，测试 golden 建议 2 vCPU、512MiB，并预留足够宿主机资源。计时到 HTTP 收到持久化租约响应；每个请求在收到领取响应后立即执行 `/bin/true`，另报从发起领取到首次 guest exec 完成的耗时；两个终点分开统计。补池、网络真正可用时间和模板制作成本须分开报告。
 
 池中 VM 已经通过 readiness 检查，领取不会再次启动、restore 或 reseed。领取后的首次命令测量包含另一笔 runtime RPC、vsock 建连和 guest 进程执行，不能称为 warm pool 的启动时间。同时设置 `KUMABOXD_POOL_EXEC_BENCH=1` 可对同一批已领取 VM 测串行与 16 路并发 exec；这组对照完全不领取新 VM，也不补池，用来区分分配延迟与执行链路延迟。
+
+设置 `KUMABOXD_POOL_CLAIM_ONLY=1` 可额外测 10 批 × 16 台的纯领取：串行和 16 路并发分开报告；每批领取完成后才执行 guest 命令，避免 exec 干扰 claim 计时。计时包括请求编码、HTTP 往返和响应解码。输出逐批连接复用情况及原始样本。通过 `KUMABOXD_POOL_DURABILITY=buffered` 选择快速策略；未设置时仍测 sync。两种策略的数据必须分别标注，不能把不同的持久化保证混作同一口径。
 
 本地设计草稿和实验报告可放在 `docs/`，该目录被 Git 忽略；需要随代码审阅的当前架构与开发说明放在本 README。
 

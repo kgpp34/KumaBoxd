@@ -91,7 +91,7 @@ func TestWarmPool(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		db, err := metadata.Open(state)
+		db, err := openPoolTestStore(state)
 		if err != nil {
 			t.Error(err)
 			return
@@ -113,7 +113,7 @@ func TestWarmPool(t *testing.T) {
 	wait(func(v pool.Status) bool { return v.Counts.Ready == 4 })
 	var lease pool.Lease
 	elapsed := call("POST", "/v1/pools/warm/claims", pool.ClaimRequest{Owner: "e2e", TTLSeconds: 300}, "first", 201, &lease)
-	t.Logf("warm claim HTTP response including durable receipt: %s (one functional observation)", elapsed)
+	t.Logf("warm claim HTTP response: %s durability=%s (one functional observation)", elapsed, lease.Durability)
 	var output bytes.Buffer
 	code, err := runtime.Exec(ctx, lease.SandboxID, runtimeclient.Command{Args: []string{"/bin/sh", "-ec", "ip -4 route show default; getent ahostsv4 example.com; curl -fsSI --max-time 15 https://example.com"}}, &output, &output)
 	if err != nil || code != 0 {
@@ -147,6 +147,9 @@ func TestWarmPool(t *testing.T) {
 	wait(func(v pool.Status) bool { return v.Counts.Leased == 0 && v.Counts.Retiring == 0 && v.Counts.Ready == 4 })
 	call("POST", "/v1/pools/warm/claims", pool.ClaimRequest{Owner: "ttl", TTLSeconds: 1}, "ttl", 410, nil)
 	t.Log("node restart, idempotent retry, conflict, renewal, release and TTL passed")
+	if os.Getenv("KUMABOXD_POOL_CLAIM_ONLY") == "1" {
+		measureWarmClaims(t, ctx, runtime, httpClient, endpoint, configure, wait)
+	}
 	if os.Getenv("KUMABOXD_POOL_BENCH") == "1" {
 		for _, maxTotal := range []int{16, 32} {
 			configure(16, maxTotal)
@@ -227,7 +230,7 @@ func TestWarmPool(t *testing.T) {
 
 func startPoolNode(t *testing.T, runtime *runtimeclient.Client, directory string) (string, func()) {
 	t.Helper()
-	store, err := metadata.Open(directory)
+	store, err := openPoolTestStore(directory)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,6 +277,7 @@ func startPoolNode(t *testing.T, runtime *runtimeclient.Client, directory string
 }
 
 func poolCall(ctx context.Context, client *http.Client, endpoint, method, path string, body any, key string, want int, output any) (time.Duration, error) {
+	started := time.Now()
 	data, err := json.Marshal(body)
 	if err != nil {
 		return 0, err
@@ -286,7 +290,6 @@ func poolCall(ctx context.Context, client *http.Client, endpoint, method, path s
 	if key != "" {
 		request.Header.Set("Idempotency-Key", key)
 	}
-	started := time.Now()
 	response, err := client.Do(request)
 	if err != nil {
 		return 0, err
@@ -303,5 +306,9 @@ func poolCall(ctx context.Context, client *http.Client, endpoint, method, path s
 	if output != nil {
 		err = json.Unmarshal(payload, output)
 	}
-	return elapsed, err
+	return time.Since(started), err
+}
+
+func openPoolTestStore(directory string) (*metadata.Store, error) {
+	return metadata.OpenWithOptions(directory, metadata.Options{PoolDurability: metadata.Durability(os.Getenv("KUMABOXD_POOL_DURABILITY"))})
 }

@@ -29,3 +29,15 @@ func TestRejectsInvalidStartup(t *testing.T) {
 		}
 	}
 }
+
+func TestPoolDurabilityIsExplicitAndValidated(t *testing.T) {
+	for _, mode := range []string{"sync", "buffered"} {
+		cfg, err := Parse([]string{"--pool-durability=" + mode}, func(string) string { return "" }, io.Discard)
+		if err != nil || cfg.PoolDurability != mode {
+			t.Fatalf("mode %s: %+v %v", mode, cfg, err)
+		}
+	}
+	if _, err := Parse([]string{"--pool-durability=unsafe"}, func(string) string { return "" }, io.Discard); err == nil {
+		t.Fatal("unknown durability accepted")
+	}
+}

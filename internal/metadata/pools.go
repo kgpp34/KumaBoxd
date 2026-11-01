@@ -61,44 +61,153 @@ func initializePools(root *bolt.Bucket) error {
 // NodeID fences runtime names to this private node database, not a hostname.
 func (s *Store) NodeID() string { return s.nodeID }
 
-// Read provides a consistent snapshot. Values are decoded copies owned by callers.
+// Durability exposes the actual acknowledgement policy to pool API receipts.
+func (s *Store) Durability() pool.Durability {
+	if s.journal != nil {
+		return pool.DurabilityBuffered
+	}
+	return pool.DurabilitySync
+}
+
+// Read gives a consistent view independent of the selected persistence policy.
 func (s *Store) Read(ctx context.Context, f func(pool.ReadTx) error) error {
+	if s.journal != nil {
+		return s.journal.read(ctx, f)
+	}
 	return s.db.View(func(tx *bolt.Tx) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		return f(newPoolTx(tx))
+		return f(boltPoolReader{tx})
 	})
 }
 
-// Write stages a request's changes before applying them inside the shared durable
-// transaction. A business error cannot leak partial writes into another request.
+// Write validates and stages one request; failed callbacks publish no changes.
 func (s *Store) Write(ctx context.Context, f func(pool.WriteTx) error) error {
+	if s.journal != nil {
+		return s.journal.write(ctx, f)
+	}
 	request := &writeRequest{ctx: ctx, reply: make(chan writeResult, 1), apply: func(tx *bolt.Tx) (writeResult, error) {
-		staged := newPoolTx(tx)
+		staged := newPoolWriteTx(boltPoolReader{tx})
 		if err := f(staged); err != nil {
-			return writeResult{err: err}, nil //nolint:nilerr // A business error aborts only this staged request, not the shared transaction.
+			return writeResult{err: err}, nil //nolint:nilerr // A business error aborts this request, not the shared transaction.
 		}
-		changed := len(staged.pools)+len(staged.slots)+len(staged.leases)+len(staged.removedSlots) > 0
-		return writeResult{changed: changed}, staged.flush()
+		return writeResult{changed: !staged.changes.empty()}, staged.changes.flush(tx)
 	}}
 	return s.writer.enqueue(request).err
 }
 
-type poolTx struct {
-	tx            *bolt.Tx
-	pools         map[string]pool.Record
-	slots         map[string]pool.Slot
-	leases        map[string]pool.Lease
-	removedSlots  map[string]bool
-	removedLeases map[string]bool
-}
+// boltPoolReader decodes owned values; it never exposes mapped database pages.
+type boltPoolReader struct{ tx *bolt.Tx }
 
-func newPoolTx(tx *bolt.Tx) *poolTx {
-	return &poolTx{tx: tx, pools: map[string]pool.Record{}, slots: map[string]pool.Slot{}, leases: map[string]pool.Lease{}, removedSlots: map[string]bool{}, removedLeases: map[string]bool{}}
+func (t boltPoolReader) bucket(n int) *bolt.Bucket {
+	return t.tx.Bucket(metadataKey).Bucket(poolBuckets[n])
 }
-func (t *poolTx) bucket(n int) *bolt.Bucket { return t.tx.Bucket(metadataKey).Bucket(poolBuckets[n]) }
-func slotKey(name, id string) string        { return name + "\x00" + id }
+func (t boltPoolReader) Pool(name string) (pool.Record, error) {
+	v, err := readValue[pool.Record](t.bucket(0), name)
+	if err != nil {
+		return v, err
+	}
+	if v.Spec.Name != name {
+		return v, errors.New("pool key mismatch")
+	}
+	return v, v.Validate()
+}
+func (t boltPoolReader) Pools() ([]pool.Record, error) {
+	all, err := scan[pool.Record](t.bucket(0), "")
+	if err != nil {
+		return nil, err
+	}
+	for _, v := range all {
+		if err := v.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	return all, nil
+}
+func (t boltPoolReader) Slot(name, id string) (pool.Slot, error) {
+	v, err := readValue[pool.Slot](t.bucket(1), slotKey(name, id))
+	if err != nil {
+		return v, err
+	}
+	if v.ID != id || v.Pool != name {
+		return v, errors.New("slot key mismatch")
+	}
+	return v, v.Validate()
+}
+func (t boltPoolReader) Slots(name string) ([]pool.Slot, error) {
+	all, err := scan[pool.Slot](t.bucket(1), name+"\x00")
+	if err != nil {
+		return nil, err
+	}
+	for _, v := range all {
+		if err := v.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	return all, nil
+}
+func (t boltPoolReader) Ready(name string) (pool.Slot, error) {
+	prefix := name + "\x00"
+	cursor := t.bucket(2).Cursor()
+	for k, _ := cursor.Seek([]byte(prefix)); k != nil && strings.HasPrefix(string(k), prefix); k, _ = cursor.Next() {
+		slot, err := t.Slot(name, string(k[len(prefix):]))
+		if errors.Is(err, pool.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return pool.Slot{}, err
+		}
+		if slot.State == pool.Ready {
+			return slot, nil
+		}
+	}
+	return pool.Slot{}, pool.ErrEmpty
+}
+func (t boltPoolReader) Lease(id string) (pool.Lease, error) {
+	row, err := readValue[leaseRow](t.bucket(3), id)
+	if err != nil {
+		return pool.Lease{}, err
+	}
+	v := restoreLease(row)
+	if v.ID != id {
+		return v, errors.New("lease key mismatch")
+	}
+	return v, v.Validate()
+}
+func (t boltPoolReader) Request(name, hash string) (pool.Lease, error) {
+	id := t.bucket(4).Get([]byte(slotKey(name, hash)))
+	if id == nil {
+		return pool.Lease{}, pool.ErrNotFound
+	}
+	v, err := t.Lease(string(id))
+	if err == nil && (v.Pool != name || v.KeyHash != hash) {
+		return v, errors.New("idempotency index mismatch")
+	}
+	return v, err
+}
+func (t boltPoolReader) ReceiptsBefore(before time.Time, limit int) ([]pool.Lease, error) {
+	if limit < 1 || limit > 256 {
+		return nil, pool.ErrInvalid
+	}
+	out := make([]pool.Lease, 0, limit)
+	cursor := t.bucket(5).Cursor()
+	for k, v := cursor.First(); k != nil && len(out) < limit; k, v = cursor.Next() {
+		if len(k) != 40 {
+			return nil, errors.New("invalid receipt index")
+		}
+		if binary.BigEndian.Uint64(k[:8]) >= uint64(before.UnixNano()) {
+			break
+		}
+		lease, err := t.Lease(string(v))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, lease)
+	}
+	return out, nil
+}
+func slotKey(name, id string) string { return name + "\x00" + id }
 func readValue[T any](b *bolt.Bucket, key string) (out T, err error) {
 	data := b.Get([]byte(key))
 	if data == nil {
@@ -129,109 +238,6 @@ func scan[T any](b *bolt.Bucket, prefix string) ([]T, error) {
 	}
 	return out, nil
 }
-func (t *poolTx) Pool(name string) (pool.Record, error) {
-	if v, ok := t.pools[name]; ok {
-		return v, nil
-	}
-	v, err := readValue[pool.Record](t.bucket(0), name)
-	if err != nil {
-		return v, err
-	}
-	if v.Spec.Name != name {
-		return v, errors.New("pool key mismatch")
-	}
-	return v, v.Validate()
-}
-func (t *poolTx) Pools() ([]pool.Record, error) {
-	list, err := scan[pool.Record](t.bucket(0), "")
-	if err != nil {
-		return nil, err
-	}
-	seen := map[string]bool{}
-	for i, v := range list {
-		if err := v.Validate(); err != nil {
-			return nil, err
-		}
-		seen[v.Spec.Name] = true
-		if next, ok := t.pools[v.Spec.Name]; ok {
-			list[i] = next
-		}
-	}
-	for k, v := range t.pools {
-		if !seen[k] {
-			list = append(list, v)
-		}
-	}
-	return list, nil
-}
-func (t *poolTx) Slot(name, id string) (pool.Slot, error) {
-	key := slotKey(name, id)
-	if t.removedSlots[key] {
-		return pool.Slot{}, pool.ErrNotFound
-	}
-	if v, ok := t.slots[key]; ok {
-		return v, nil
-	}
-	v, err := readValue[pool.Slot](t.bucket(1), key)
-	if err != nil {
-		return v, err
-	}
-	if v.ID != id || v.Pool != name {
-		return v, errors.New("slot key mismatch")
-	}
-	return v, v.Validate()
-}
-func (t *poolTx) Slots(name string) ([]pool.Slot, error) {
-	list, err := scan[pool.Slot](t.bucket(1), name+"\x00")
-	if err != nil {
-		return nil, err
-	}
-	out := make([]pool.Slot, 0, len(list))
-	seen := map[string]bool{}
-	for _, v := range list {
-		if err := v.Validate(); err != nil {
-			return nil, err
-		}
-		key := slotKey(v.Pool, v.ID)
-		seen[key] = true
-		if t.removedSlots[key] {
-			continue
-		}
-		if next, ok := t.slots[key]; ok {
-			v = next
-		}
-		out = append(out, v)
-	}
-	for k, v := range t.slots {
-		if v.Pool == name && !seen[k] && !t.removedSlots[k] {
-			out = append(out, v)
-		}
-	}
-	return out, nil
-}
-func (t *poolTx) Ready(name string) (pool.Slot, error) {
-	prefix := name + "\x00"
-	cursor := t.bucket(2).Cursor()
-	for key, _ := cursor.Seek([]byte(prefix)); key != nil && strings.HasPrefix(string(key), prefix); key, _ = cursor.Next() {
-		id := string(key[len(prefix):])
-		slot, err := t.Slot(name, id)
-		if errors.Is(err, pool.ErrNotFound) {
-			continue
-		}
-		if err != nil {
-			return pool.Slot{}, err
-		}
-		if slot.State == pool.Ready {
-			return slot, nil
-		}
-	}
-	for k, v := range t.slots {
-		if v.Pool == name && v.State == pool.Ready && !t.removedSlots[k] {
-			return v, nil
-		}
-	}
-	return pool.Slot{}, pool.ErrEmpty
-}
 
 // leaseRow keeps the idempotency fields private in the public API while retaining
 // them on disk. They must survive restarts to prevent duplicate allocations.
@@ -246,146 +252,76 @@ func restoreLease(v leaseRow) pool.Lease {
 	v.Lease.RequestHash = v.RequestHash
 	return v.Lease
 }
-func (t *poolTx) Lease(id string) (pool.Lease, error) {
-	if t.removedLeases[id] {
-		return pool.Lease{}, pool.ErrNotFound
-	}
-	if v, ok := t.leases[id]; ok {
-		return v, nil
-	}
-	v, err := readValue[leaseRow](t.bucket(3), id)
-	if err != nil {
-		return pool.Lease{}, err
-	}
-	result := restoreLease(v)
-	if result.ID != id {
-		return result, errors.New("lease key mismatch")
-	}
-	return result, result.Validate()
-}
-func (t *poolTx) Request(name, hash string) (pool.Lease, error) {
-	for id, v := range t.leases {
-		if v.Pool == name && v.KeyHash == hash && !t.removedLeases[id] {
-			return v, nil
-		}
-	}
-	id := t.bucket(4).Get([]byte(slotKey(name, hash)))
-	if id == nil {
-		return pool.Lease{}, pool.ErrNotFound
-	}
-	v, err := t.Lease(string(id))
-	if err == nil && (v.Pool != name || v.KeyHash != hash) {
-		return pool.Lease{}, errors.New("idempotency index mismatch")
-	}
-	return v, err
-}
-
-// ReceiptsBefore uses a terminal-time index; GC never scans every historical lease
-// while holding the single writer. Each pass is bounded and yields to claims.
-func (t *poolTx) ReceiptsBefore(before time.Time, limit int) ([]pool.Lease, error) {
-	if limit < 1 || limit > 256 {
-		return nil, pool.ErrInvalid
-	}
-	out := make([]pool.Lease, 0, limit)
-	cursor := t.bucket(5).Cursor()
-	for key, value := cursor.First(); key != nil && len(out) < limit; key, value = cursor.Next() {
-		if len(key) != 40 {
-			return nil, errors.New("invalid receipt index")
-		}
-		if binary.BigEndian.Uint64(key[:8]) >= uint64(before.UnixNano()) {
-			break
-		}
-		lease, err := t.Lease(string(value))
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, lease)
-	}
-	return out, nil
-}
 func receiptKey(lease pool.Lease) []byte {
 	key := make([]byte, 8, 40)
 	binary.BigEndian.PutUint64(key, uint64(lease.UpdatedAt.UnixNano()))
 	return append(key, lease.ID...)
 }
 
-func (t *poolTx) SavePool(v pool.Record) { t.pools[v.Spec.Name] = v }
-func (t *poolTx) SaveSlot(v pool.Slot) {
-	k := slotKey(v.Pool, v.ID)
-	t.slots[k] = v
-	delete(t.removedSlots, k)
-}
-func (t *poolTx) SaveLease(v pool.Lease)   { t.leases[v.ID] = v; delete(t.removedLeases, v.ID) }
-func (t *poolTx) RemoveSlot(v pool.Slot)   { t.removedSlots[slotKey(v.Pool, v.ID)] = true }
-func (t *poolTx) RemoveLease(v pool.Lease) { t.removedLeases[v.ID] = true; t.leases[v.ID] = v }
-func (t *poolTx) flush() error {
-	for k, v := range t.pools {
-		if err := v.Validate(); err != nil {
-			return err
-		}
-		if err := writeValue(t.bucket(0), k, v); err != nil {
+func (d poolDelta) flush(tx *bolt.Tx) error {
+	if err := d.validate(); err != nil {
+		return err
+	}
+	bucket := func(n int) *bolt.Bucket { return tx.Bucket(metadataKey).Bucket(poolBuckets[n]) }
+	for k, v := range d.Pools {
+		if err := writeValue(bucket(0), k, v); err != nil {
 			return err
 		}
 	}
-	for k, v := range t.slots {
-		if t.removedSlots[k] {
+	for k, v := range d.Slots {
+		if d.RemovedSlots[k] {
 			continue
 		}
-		if err := v.Validate(); err != nil {
-			return err
-		}
-		if err := writeValue(t.bucket(1), k, v); err != nil {
+		if err := writeValue(bucket(1), k, v); err != nil {
 			return err
 		}
 		var err error
 		if v.State == pool.Ready {
-			err = t.bucket(2).Put([]byte(k), []byte{1})
+			err = bucket(2).Put([]byte(k), []byte{1})
 		} else {
-			err = t.bucket(2).Delete([]byte(k))
+			err = bucket(2).Delete([]byte(k))
 		}
 		if err != nil {
 			return err
 		}
 	}
-	for k := range t.removedSlots {
-		if err := t.bucket(1).Delete([]byte(k)); err != nil {
+	for k := range d.RemovedSlots {
+		if err := bucket(1).Delete([]byte(k)); err != nil {
 			return err
 		}
-		if err := t.bucket(2).Delete([]byte(k)); err != nil {
+		if err := bucket(2).Delete([]byte(k)); err != nil {
 			return err
 		}
 	}
-	for id, v := range t.leases {
-		previous, err := readValue[leaseRow](t.bucket(3), id)
+	for id, row := range d.Leases {
+		v := restoreLease(row)
+		previous, err := readValue[leaseRow](bucket(3), id)
 		if err != nil && !errors.Is(err, pool.ErrNotFound) {
 			return err
 		}
 		if err == nil {
-			if err := t.bucket(5).Delete(receiptKey(previous.Lease)); err != nil {
+			if err := bucket(5).Delete(receiptKey(previous.Lease)); err != nil {
 				return err
 			}
 		}
 		k := []byte(slotKey(v.Pool, v.KeyHash))
-		if t.removedLeases[id] {
-			if err := t.bucket(3).Delete([]byte(id)); err != nil {
+		if d.RemovedLeases[id] {
+			if err := bucket(3).Delete([]byte(id)); err != nil {
 				return err
 			}
-			if err := t.bucket(4).Delete(k); err != nil {
+			if err := bucket(4).Delete(k); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := v.Validate(); err != nil {
+		if err := writeValue(bucket(3), id, leaseRow{v, v.KeyHash, v.RequestHash}); err != nil {
 			return err
 		}
-		if err := writeValue(t.bucket(3), id, leaseRow{v, v.KeyHash, v.RequestHash}); err != nil {
+		if err := bucket(4).Put(k, []byte(id)); err != nil {
 			return err
 		}
-		if err := t.bucket(4).Put(k, []byte(id)); err != nil {
-			return err
-		}
-		if (v.State == pool.Released || v.State == pool.Lost) && t.bucket(1).Get([]byte(slotKey(v.Pool, v.SlotID))) == nil {
-			if err := t.bucket(5).Put(receiptKey(v), []byte(id)); err != nil {
+		if (v.State == pool.Released || v.State == pool.Lost) && bucket(1).Get([]byte(slotKey(v.Pool, v.SlotID))) == nil {
+			if err := bucket(5).Put(receiptKey(v), []byte(id)); err != nil {
 				return err
 			}
 		}

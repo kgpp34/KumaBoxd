@@ -25,12 +25,13 @@ var (
 	metadataKey  = []byte("kumaboxd")
 )
 
-// Store holds one process-wide database handle with durable write transactions.
-// Concurrent writes share durable transactions through one process-owned writer.
+// Store owns one process-wide database and its selected pool acknowledgement policy.
+// Templates and checkpoints share synchronous transactions through one writer.
 type Store struct {
 	nodeID    string
 	db        *bolt.DB
 	writer    *writeQueue
+	journal   *poolJournal
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -39,7 +40,15 @@ var _ template.Store = (*Store)(nil)
 
 // Open creates a private node.db with exclusive ownership and synchronous commits.
 // An unknown file format is rejected; runtime database names are never used.
-func Open(directory string) (*Store, error) {
+func Open(directory string) (*Store, error) { return OpenWithOptions(directory, Options{}) }
+
+// OpenWithOptions chooses explicit acknowledgement semantics for pool changes.
+// Template writes and all bbolt checkpoints always remain synchronous.
+func OpenWithOptions(directory string, options Options) (*Store, error) {
+	options, err := options.normalized()
+	if err != nil {
+		return nil, err
+	}
 	if !filepath.IsAbs(directory) {
 		return nil, errors.New("metadata directory must be absolute")
 	}
@@ -69,7 +78,10 @@ func Open(directory string) (*Store, error) {
 			if string(root.Get(formatKey)) != format || root.Bucket(templatesKey) == nil {
 				return errors.New("unsupported node database format")
 			}
-			return initializePools(root)
+			if err := initializePools(root); err != nil {
+				return err
+			}
+			return setPoolDurability(root, options.PoolDurability)
 		}
 		key, _ := tx.Cursor().First()
 		if key != nil {
@@ -85,7 +97,10 @@ func Open(directory string) (*Store, error) {
 		if _, err = root.CreateBucket(templatesKey); err != nil {
 			return err
 		}
-		return initializePools(root)
+		if err := initializePools(root); err != nil {
+			return err
+		}
+		return setPoolDurability(root, options.PoolDurability)
 	})
 	if err != nil {
 		return nil, errors.Join(err, db.Close())
@@ -94,14 +109,26 @@ func Open(directory string) (*Store, error) {
 	if err := db.View(func(tx *bolt.Tx) error { nodeID = string(tx.Bucket(metadataKey).Get(nodeIDKey)); return nil }); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
-	return &Store{nodeID: nodeID, db: db, writer: newWriteQueue(db)}, nil
+	store := &Store{nodeID: nodeID, db: db, writer: newWriteQueue(db)}
+	if options.PoolDurability == Buffered {
+		journal, err := openPoolJournal(store, directory, options.CheckpointInterval)
+		if err != nil {
+			store.writer.close()
+			return nil, errors.Join(err, db.Close())
+		}
+		store.journal = journal
+	}
+	return store, nil
 }
 
 // Close releases node state after HTTP requests and background users have stopped.
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
+		if s.journal != nil {
+			s.closeErr = s.journal.close()
+		}
 		s.writer.close()
-		s.closeErr = s.db.Close()
+		s.closeErr = errors.Join(s.closeErr, s.db.Close())
 	})
 	return s.closeErr
 }

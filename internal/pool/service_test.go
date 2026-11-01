@@ -578,3 +578,50 @@ func TestAdmissionChargesInheritedDataDisks(t *testing.T) {
 		t.Fatalf("data disk reservation was ignored: %v", err)
 	}
 }
+
+func TestBufferedLeaseAdvertisesItsPolicyAndSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state")
+	store, err := metadata.OpenWithOptions(path, metadata.Options{PoolDurability: metadata.Buffered})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := runtimeFixture()
+	s := service(t, store, runtime, options())
+	stop := start(t, s)
+	configured(t, s, 1, 1)
+	ready(t, s, 1)
+	request := pool.ClaimRequest{Key: "buffered-key", Owner: "owner", TTLSeconds: 300}
+	lease, created, err := s.Claim(context.Background(), "test", request)
+	if err != nil || !created || lease.Durability != pool.DurabilityBuffered {
+		t.Fatalf("receipt hides its policy: %+v %t %v", lease, created, err)
+	}
+	stop()
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = metadata.OpenWithOptions(path, metadata.Options{PoolDurability: metadata.Buffered})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	s = service(t, store, runtime, options())
+	stop = start(t, s)
+	defer stop()
+	until(t, s.Ready)
+	replay, created, err := s.Claim(context.Background(), "test", request)
+	if err != nil || created || replay.ID != lease.ID || replay.SandboxID != lease.SandboxID || replay.Durability != pool.DurabilityBuffered {
+		t.Fatalf("buffered retry changed receipt: %+v %v", replay, err)
+	}
+	configured(t, s, 0, 1)
+	if _, err := s.Release(context.Background(), lease.ID); err != nil {
+		t.Fatal(err)
+	}
+	until(t, func() bool {
+		status, err := s.Status(context.Background(), "test")
+		return err == nil && status.Counts.Total == 0 && status.Durability == pool.DurabilityBuffered
+	})
+}

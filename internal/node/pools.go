@@ -19,7 +19,7 @@ type Inventory interface {
 	List(context.Context) ([]pool.Status, error)
 }
 
-// Allocator returns durable allocation receipts without exposing storage handles.
+// Allocator returns allocation receipts with explicit durability without exposing storage handles.
 type Allocator interface {
 	Claim(context.Context, string, pool.ClaimRequest) (pool.Lease, bool, error)
 	GetLease(context.Context, string) (pool.Lease, error)

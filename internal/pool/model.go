@@ -1,4 +1,4 @@
-// Package pool owns node-local warm inventory and durable leases. VM, disk and
+// Package pool owns node-local warm inventory and persisted leases. VM, disk and
 // network lifecycle operations remain behind the runtime RPC boundary.
 //
 // golden -> creating -> checking -> ready -> leased -> retiring -> removed
@@ -79,20 +79,32 @@ const (
 	Lost      = "lost"
 )
 
-// Lease is the durable allocation receipt. KeyHash stores no raw idempotency key.
-// Renewals use absolute deadlines so repeating a renewal cannot extend it again.
+// Durability states whether an acknowledgement waits for stable storage.
+type Durability string
+
+const (
+	// DurabilitySync waits for stable storage before acknowledging changes.
+	DurabilitySync Durability = "sync"
+	// DurabilityBuffered accepts an OS-buffered log append before checkpointing.
+	DurabilityBuffered Durability = "buffered"
+)
+
+// Lease records allocation identity, expiry and acknowledgement durability.
+// KeyHash retains no raw key; absolute renewal deadlines make retries stable.
 type Lease struct {
-	ID          string    `json:"id"`
-	Pool        string    `json:"pool"`
-	SlotID      string    `json:"slot_id"`
-	SandboxID   string    `json:"sandbox_id"`
-	Owner       string    `json:"owner"`
-	State       string    `json:"state"`
-	KeyHash     string    `json:"-"`
-	RequestHash string    `json:"-"`
-	CreatedAt   time.Time `json:"created_at"`
-	ExpiresAt   time.Time `json:"expires_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	// Durability is empty only on legacy receipts created before this field existed.
+	Durability  Durability `json:"durability,omitempty"`
+	ID          string     `json:"id"`
+	Pool        string     `json:"pool"`
+	SlotID      string     `json:"slot_id"`
+	SandboxID   string     `json:"sandbox_id"`
+	Owner       string     `json:"owner"`
+	State       string     `json:"state"`
+	KeyHash     string     `json:"-"`
+	RequestHash string     `json:"-"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ExpiresAt   time.Time  `json:"expires_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
 // ClaimRequest's key comes from Idempotency-Key; it is not a VM name or guest input.
@@ -125,9 +137,10 @@ type WriteTx interface {
 	RemoveLease(Lease)
 }
 
-// Store serializes atomic transitions and acknowledges only durable commits.
+// Store serializes atomic transitions under an explicit acknowledgement policy.
 type Store interface {
 	NodeID() string
+	Durability() Durability
 	Read(context.Context, func(ReadTx) error) error
 	Write(context.Context, func(WriteTx) error) error
 }
@@ -346,6 +359,9 @@ func (s Slot) Validate() error {
 
 // Validate preserves the idempotency receipt's link to one allocation.
 func (l Lease) Validate() error {
+	if l.Durability != "" && l.Durability != DurabilitySync && l.Durability != DurabilityBuffered {
+		return errors.New("invalid lease durability")
+	}
 	if !ValidID(l.ID) || !ValidID(l.SlotID) || validName(l.Pool) != nil || l.SandboxID == "" || !text(l.Owner, 128) || l.CreatedAt.IsZero() || l.UpdatedAt.IsZero() || !l.ExpiresAt.After(l.CreatedAt) {
 		return errors.New("invalid persisted lease")
 	}
