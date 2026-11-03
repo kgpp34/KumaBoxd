@@ -20,6 +20,29 @@ Claims allocate an existing ready sandbox. Preparation and replenishment run in
 the background. Used sandboxes are destroyed after release or expiry and replaced
 with fresh instances from the template.
 
+## Benchmarks
+
+Measured on November 1, 2026: Xeon E3-1245 v2 (4 cores / 8 threads), 32 GiB RAM,
+SATA SSD RAID1, XFS, Linux 7.0.0-34 and Cloud Hypervisor v54 with mmap restore.
+Each pool VM has 2 vCPUs, 512 MiB RAM, a 10 GiB writable disk and one eBPF NIC.
+
+| Durability | Claim load | p50 (ms) | p95 (ms) | Samples |
+| --- | --- | ---: | ---: | ---: |
+| `sync` (default) | Serial | 0.891 | 1.745 | 480 |
+| `sync` (default) | 16 concurrent | 3.609 | 6.484 | 480 |
+| `buffered` | Serial | 0.230 | 0.543 | 480 |
+| `buffered` | 16 concurrent | 1.714 | 3.526 | 480 |
+
+Each row pools 480 request samples from three interleaved rounds, with 10 batches
+of 16 claims per round. Every batch starts with 16 ready VMs; refill is excluded.
+Timing includes request encoding, loopback HTTP/1.1 and response decoding.
+VM preparation and subsequent guest commands are outside the claim measurement.
+Claimed VMs were verified with `/bin/true` after claim timing stopped.
+
+`sync` acknowledges a synchronous bbolt commit. `buffered` acknowledges a journal
+append to the OS cache and checkpoints asynchronously; host failure can lose
+recently acknowledged changes. These are different durability guarantees.
+
 ## Architecture
 
 ```text
