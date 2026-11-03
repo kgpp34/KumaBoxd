@@ -2,7 +2,6 @@
   <img src="assets/logo.png" alt="KumaBoxd logo" width="144">
 </p>
 
-<h1 align="center">KumaBoxd</h1>
 <p align="center">Node-local sandbox orchestration for KumaBox.</p>
 
 KumaBoxd manages ready-to-use microVM sandboxes on a single Linux node. Built on
